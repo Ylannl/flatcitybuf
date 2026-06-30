@@ -5,13 +5,13 @@ mod util;
 
 #[cfg(target_arch = "wasm32")]
 mod wasm {
-    use crate::gloo_client::WasmHttpClient;
+    use crate::gloo_client::{WasmBufferedHttpRangeClient64, WasmHttpClient};
 
     use fcb_core::{size_prefixed_root_as_header, Header, Operator};
     use js_sys::Array;
 
     use log::Level;
-    use serde_wasm_bindgen::to_value;
+    use serde::Serialize;
     use wasm_bindgen::prelude::*;
 
     use fcb_core::static_btree::{FixedStringKey, Float, HttpIndex, HttpMultiIndex, KeyType};
@@ -28,17 +28,14 @@ mod wasm {
         MAGIC_BYTES_SIZE,
     };
 
-    use std::fmt::Error;
     use std::result::Result;
     use std::sync::atomic::{AtomicBool, Ordering};
 
     use http_range_client::{AsyncBufferedHttpRangeClient, AsyncHttpRangeClient};
 
-    use fcb_core::packed_rtree::{
-        http::HttpRange, http::HttpSearchResultItem, NodeItem, PackedRTree, Query as SpatialQuery,
-    };
+    use fcb_core::packed_rtree::{http::HttpRange, NodeItem, PackedRTree, Query as SpatialQuery};
     use std::collections::VecDeque;
-    use std::ops::Range;
+    use std::ops::{Range, RangeFrom};
 
     // The largest request we'll speculatively make.
     // If a single huge feature requires, we'll necessarily exceed this limit.
@@ -51,6 +48,7 @@ mod wasm {
     #[wasm_bindgen]
     pub struct HttpFcbReader {
         client: AsyncBufferedHttpRangeClient<WasmHttpClient>,
+        client64: WasmBufferedHttpRangeClient64,
         // feature reading requires header access, therefore
         // header_buf is included in the FcbBuffer struct.
         fbs: FcbBuffer,
@@ -59,6 +57,7 @@ mod wasm {
     #[wasm_bindgen]
     pub struct AsyncFeatureIter {
         client: AsyncBufferedHttpRangeClient<WasmHttpClient>,
+        client64: WasmBufferedHttpRangeClient64,
         // feature reading requires header access, therefore
         // header_buf is included in the FcbBuffer struct.
         fbs: FcbBuffer,
@@ -72,6 +71,8 @@ mod wasm {
     impl HttpFcbReader {
         #[wasm_bindgen(constructor, start)]
         pub async fn new(url: String) -> Result<HttpFcbReader, JsValue> {
+            console_error_panic_hook::set_once();
+
             // Only initialize the logger once
             if !LOGGER_INITIALIZED.load(Ordering::SeqCst)
                 && console_log::init_with_level(Level::Info).is_ok()
@@ -81,12 +82,14 @@ mod wasm {
             }
 
             let client = WasmHttpClient::new(&url);
+            let client64 = WasmBufferedHttpRangeClient64::new(&url);
 
-            Self::_open(client).await
+            Self::_open(client, client64).await
         }
 
         async fn _open(
             mut client: AsyncBufferedHttpRangeClient<WasmHttpClient>,
+            client64: WasmBufferedHttpRangeClient64,
         ) -> Result<HttpFcbReader, JsValue> {
             // Because we use a buffered HTTP reader, anything extra we fetch here can
             // be utilized to skip subsequent fetches.
@@ -151,6 +154,7 @@ mod wasm {
                 .map_err(|e| JsValue::from_str(&e.to_string()))?;
             Ok(HttpFcbReader {
                 client,
+                client64,
                 fbs: FcbBuffer {
                     header_buf,
                     features_buf: Vec::new(),
@@ -162,7 +166,7 @@ mod wasm {
         pub fn cityjson(&self) -> Result<JsValue, JsValue> {
             let header = self.fbs.header();
             let cj = to_cj_metadata(&header).map_err(|e| JsValue::from_str(&e.to_string()))?;
-            let jsval = to_value(&cj).map_err(|e| JsValue::from_str(&e.to_string()))?;
+            let jsval = to_js_value(&cj)?;
             Ok(jsval)
         }
 
@@ -172,46 +176,93 @@ mod wasm {
                 .fbs
                 .meta()
                 .map_err(|e| JsValue::from_str(&e.to_string()))?;
-            let js = to_value(&meta).map_err(|e| JsValue::from_str(&e.to_string()))?;
+            let js = to_js_value(&meta)?;
             Ok(js)
+        }
+
+        /// Return the spatial extent stored in the root R-tree node.
+        ///
+        /// This is available for indexed files even when the CityJSON metadata has
+        /// no geographical extent.
+        #[wasm_bindgen]
+        pub async fn spatial_extent(&mut self) -> Result<JsValue, JsValue> {
+            let index_node_size = self.fbs.header().index_node_size();
+            let features_count = self.fbs.header().features_count();
+            if index_node_size == 0 || features_count == 0 {
+                return Err(JsValue::from_str("NoIndex"));
+            }
+
+            let root = self.root_rtree_node().await?;
+
+            let result = js_sys::Object::new();
+            js_sys::Reflect::set(
+                &result,
+                &JsValue::from_str("minX"),
+                &JsValue::from_f64(root.min_x),
+            )?;
+            js_sys::Reflect::set(
+                &result,
+                &JsValue::from_str("minY"),
+                &JsValue::from_f64(root.min_y),
+            )?;
+            js_sys::Reflect::set(
+                &result,
+                &JsValue::from_str("maxX"),
+                &JsValue::from_f64(root.max_x),
+            )?;
+            js_sys::Reflect::set(
+                &result,
+                &JsValue::from_str("maxY"),
+                &JsValue::from_f64(root.max_y),
+            )?;
+
+            Ok(result.into())
+        }
+
+        async fn root_rtree_node(&mut self) -> Result<NodeItem, JsValue> {
+            let index_begin = self.header_len();
+            let bytes = self
+                .client64
+                .min_req_size(0)
+                .get_range(index_begin as u64, std::mem::size_of::<NodeItem>())
+                .await
+                .map_err(|e| JsValue::from_str(&e.to_string()))?;
+            let mut cursor = std::io::Cursor::new(bytes.as_ref());
+            NodeItem::from_reader(&mut cursor).map_err(|e| JsValue::from_str(&e.to_string()))
         }
 
         fn header_len(&self) -> usize {
             MAGIC_BYTES_SIZE + self.fbs.header_buf.len()
         }
 
-        fn rtree_index_size(&self) -> usize {
+        fn rtree_index_size(&self) -> Result<usize, JsValue> {
+            u64_to_usize_file_offset(self.rtree_index_size_u64(), "R-tree index")
+        }
+
+        fn rtree_index_size_u64(&self) -> u64 {
             let header = self.fbs.header();
             let feat_count = header.features_count() as usize;
             if header.index_node_size() > 0 && feat_count > 0 {
-                PackedRTree::index_size(feat_count, header.index_node_size())
+                PackedRTree::index_size(feat_count, header.index_node_size()) as u64
             } else {
                 0
             }
         }
 
-        fn attr_index_size(&self) -> usize {
-            let header = self.fbs.header();
-            header
+        fn attr_index_size(&self) -> Result<usize, JsValue> {
+            u64_to_usize_file_offset(self.attr_index_size_u64(), "attribute index")
+        }
+
+        fn attr_index_size_u64(&self) -> u64 {
+            self.fbs
+                .header()
                 .attribute_index()
-                .map(|attr_index| {
-                    attr_index
-                        .iter()
-                        .try_fold(0, |acc, ai| {
-                            let len = ai.length() as usize;
-                            if len > usize::MAX - acc {
-                                Err(JsValue::from_str("attribute index size overflow"))
-                            } else {
-                                Ok(acc + len)
-                            }
-                        }) // sum of all attribute index lengths
-                        .unwrap_or(0)
-                })
+                .map(|attr_index| attr_index.iter().map(|ai| ai.length() as u64).sum())
                 .unwrap_or(0)
         }
 
-        fn index_size(&self) -> usize {
-            self.rtree_index_size() + self.attr_index_size()
+        fn feature_begin_u64(&self) -> u64 {
+            self.header_len() as u64 + self.rtree_index_size_u64() + self.attr_index_size_u64()
         }
 
         /// Select all features.
@@ -220,11 +271,10 @@ mod wasm {
             let header = self.fbs.header();
             let count = header.features_count();
             // TODO: support reading with unknown feature count
-            let index_size = self.index_size();
-            // Skip index
-            let feature_base = self.header_len() + index_size;
+            let feature_base = self.feature_begin_u64();
             Ok(AsyncFeatureIter {
                 client: self.client,
+                client64: self.client64,
                 fbs: self.fbs,
                 selection: FeatureSelection::SelectAll(SelectAll {
                     features_left: count,
@@ -252,63 +302,121 @@ mod wasm {
             limit: Option<u32>,
             offset: Option<u32>,
         ) -> Result<AsyncFeatureIter, JsValue> {
+            let (count, selection) = self.spatial_selection(query, limit, offset).await?;
+
+            Ok(AsyncFeatureIter {
+                client: self.client,
+                client64: self.client64,
+                fbs: self.fbs,
+                selection,
+                count,
+            })
+        }
+
+        /// Query spatially selected features without consuming the reader.
+        ///
+        /// Returns `{ totalCount, features }`, where `totalCount` is the number of
+        /// features matching the spatial query before pagination and `features`
+        /// contains the decoded CityJSONFeature objects for the requested page.
+        #[wasm_bindgen]
+        pub async fn query_spatial_features(
+            &mut self,
+            query: &WasmSpatialQuery,
+            limit: Option<u32>,
+            offset: Option<u32>,
+        ) -> Result<JsValue, JsValue> {
+            let (total_count, mut selection) = self.spatial_selection(query, limit, offset).await?;
+            let features = Array::new();
+
+            while let Some(buffer) = selection
+                .next_feature_buffer(&mut self.client, &mut self.client64)
+                .await?
+            {
+                self.fbs.features_buf = buffer.to_vec();
+                let feature = size_prefixed_root_as_city_feature(&self.fbs.features_buf)
+                    .map_err(|e| JsValue::from_str(&e.to_string()))?;
+                let header = self.fbs.header();
+                let cj_feature =
+                    to_cj_feature(feature, header.columns(), header.semantic_columns())
+                        .map_err(|e| JsValue::from_str(&e.to_string()))?;
+
+                features.push(&to_js_value(&cj_feature)?);
+            }
+
+            let result = js_sys::Object::new();
+            js_sys::Reflect::set(
+                &result,
+                &JsValue::from_str("totalCount"),
+                &JsValue::from_f64(total_count as f64),
+            )?;
+            js_sys::Reflect::set(&result, &JsValue::from_str("features"), &features)?;
+            Ok(result.into())
+        }
+
+        async fn spatial_selection(
+            &mut self,
+            query: &WasmSpatialQuery,
+            limit: Option<u32>,
+            offset: Option<u32>,
+        ) -> Result<(usize, FeatureSelection), JsValue> {
             // Read R-Tree index and build filter for features within bbox
             let header = self.fbs.header();
-            if header.index_node_size() == 0 || header.features_count() == 0 {
+            let index_node_size = header.index_node_size();
+            let features_count = header.features_count();
+            if index_node_size == 0 || features_count == 0 {
                 return Err(JsValue::from_str("NoIndex"));
             }
-            let count = header.features_count() as usize;
+            let count = features_count as usize;
             let header_len = self.header_len();
 
             // request up to this many extra bytes if it means we can eliminate an extra request
             let combine_request_threshold = 256 * 1024;
-            let attr_index_size = self.attr_index_size();
+            let attr_index_size = self.attr_index_size_u64();
 
             // Clone the inner query value
             let inner_query = query.get_inner();
 
-            let list = PackedRTree::http_stream_search(
-                &mut self.client,
-                header_len,
+            if let (Some(limit), 0, SpatialQuery::BBox(min_x, min_y, max_x, max_y)) =
+                (limit, offset.unwrap_or(0), inner_query)
+            {
+                let root = self.root_rtree_node().await?;
+                if bbox_covers_node(min_x, min_y, max_x, max_y, &root) {
+                    let feature_base = self.feature_begin_u64();
+                    return Ok((
+                        count,
+                        FeatureSelection::SelectAll(SelectAll {
+                            features_left: (limit as u64).min(features_count),
+                            pos: feature_base,
+                        }),
+                    ));
+                }
+            }
+
+            let page = http_stream_search64(
+                &mut self.client64,
+                header_len as u64,
                 attr_index_size,
                 count,
                 PackedRTree::DEFAULT_NODE_SIZE,
-                inner_query,
+                query.get_inner(),
                 combine_request_threshold,
+                limit.map(|value| value as usize),
+                offset.unwrap_or(0) as usize,
             )
-            .await
-            .map_err(|e| JsValue::from_str(&e.to_string()))?;
+            .await?;
             debug_assert!(
-                list.windows(2)
+                page.items
+                    .windows(2)
                     .all(|w| w[0].range.start() < w[1].range.start()),
                 "Since the tree is traversed breadth first, list should be sorted by construction."
             );
 
-            let total_count = list.len();
+            let total_count = page.total_count;
 
-            // Apply pagination
-            let start = offset.unwrap_or(0) as usize;
-            let start = start.min(total_count);
-            let end = match limit {
-                Some(l) => start.saturating_add(l as usize).min(total_count),
-                None => total_count,
-            };
-            let page_list: Vec<_> = if start < end {
-                list.into_iter().skip(start).take(end - start).collect()
-            } else {
-                Vec::new()
-            };
-
-            let feature_batches = FeatureBatch::make_batches(page_list, combine_request_threshold)
-                .await
-                .map_err(|e| JsValue::from_str(&e.to_string()))?;
+            let feature_batches =
+                FeatureBatch::make_batches(page.items, combine_request_threshold).await?;
             let selection = FeatureSelection::SelectSpatial(SelectSpatial { feature_batches });
-            Ok(AsyncFeatureIter {
-                client: self.client,
-                fbs: self.fbs,
-                selection,
-                count: total_count,
-            })
+            Ok((total_count, selection))
         }
 
         #[wasm_bindgen]
@@ -333,10 +441,12 @@ mod wasm {
 
             // file structure:
             // magic_bytes + header + rtree_index + attr_index1 + attr_index2 + ... + features
-            let rtree_index_size = self.rtree_index_size();
-            let attr_index_size = self.attr_index_size();
-            let attr_index_begin = header_len + rtree_index_size;
-            let feature_begin = header_len + rtree_index_size + attr_index_size;
+            let rtree_index_size = self.rtree_index_size()?;
+            let attr_index_size = self.attr_index_size()?;
+            let attr_index_begin =
+                checked_file_offset_add(header_len, rtree_index_size, "attribute index")?;
+            let feature_begin =
+                checked_file_offset_add(attr_index_begin, attr_index_size, "feature data")?;
 
             let combine_request_threshold = 1024 * 1024; // TODO: make this configurable
             let attr_index_entries = header
@@ -366,7 +476,11 @@ mod wasm {
                     combine_request_threshold,
                 )
                 .map_err(|e| JsValue::from_str(&format!("failed to add index: {e:?}")))?;
-                current_index_begin += attr_info.length() as usize;
+                current_index_begin = checked_file_offset_add(
+                    current_index_begin,
+                    u64_to_usize_file_offset(attr_info.length().into(), "attribute index")?,
+                    "attribute index",
+                )?;
             }
             // self.client.set_min_req_size(combine_request_threshold);
             let result = http_multi_index
@@ -403,6 +517,7 @@ mod wasm {
 
             Ok(AsyncFeatureIter {
                 client: self.client,
+                client64: self.client64,
                 fbs: self.fbs,
                 selection: FeatureSelection::SelectAttr(SelectAttr {
                     ranges: http_ranges,
@@ -568,7 +683,7 @@ mod wasm {
         pub fn header(&self) -> Result<JsValue, JsValue> {
             let header = self.fbs.header();
             let cj = to_cj_metadata(&header).map_err(|e| JsValue::from_str(&e.to_string()))?;
-            to_value(&cj).map_err(|e| JsValue::from_str(&e.to_string()))
+            to_js_value(&cj)
         }
         /// Number of selected features (might be unknown)
         #[wasm_bindgen]
@@ -584,9 +699,8 @@ mod wasm {
         pub async fn next(&mut self) -> Result<Option<JsValue>, JsValue> {
             let Some(buffer) = self
                 .selection
-                .next_feature_buffer(&mut self.client)
-                .await
-                .map_err(|e| JsValue::from_str(&e.to_string()))?
+                .next_feature_buffer(&mut self.client, &mut self.client64)
+                .await?
             else {
                 return Ok(None);
             };
@@ -603,7 +717,7 @@ mod wasm {
             )
             .map_err(|e| JsValue::from_str(&e.to_string()))?;
 
-            Ok(Some(to_value(&cj_feature)?))
+            Ok(Some(to_js_value(&cj_feature)?))
         }
 
         #[wasm_bindgen]
@@ -614,8 +728,276 @@ mod wasm {
                 self._header().semantic_columns(),
             )
             .map_err(|e| JsValue::from_str(&e.to_string()))?;
-            Ok(to_value(&cj_feature)?)
+            Ok(to_js_value(&cj_feature)?)
         }
+    }
+
+    fn to_js_value<T: Serialize>(value: &T) -> Result<JsValue, JsValue> {
+        let json = serde_json::to_string(value).map_err(|e| JsValue::from_str(&e.to_string()))?;
+        js_sys::JSON::parse(&json)
+    }
+
+    fn bbox_covers_node(min_x: f64, min_y: f64, max_x: f64, max_y: f64, node: &NodeItem) -> bool {
+        const EPSILON: f64 = 1.0e-9;
+        min_x <= node.min_x + EPSILON
+            && min_y <= node.min_y + EPSILON
+            && max_x >= node.max_x - EPSILON
+            && max_y >= node.max_y - EPSILON
+    }
+
+    fn u64_to_usize_file_offset(value: u64, context: &str) -> Result<usize, JsValue> {
+        usize::try_from(value).map_err(|_| large_file_offset_error(context))
+    }
+
+    fn checked_file_offset_add(left: usize, right: usize, context: &str) -> Result<usize, JsValue> {
+        left.checked_add(right)
+            .ok_or_else(|| large_file_offset_error(context))
+    }
+
+    fn large_file_offset_error(context: &str) -> JsValue {
+        JsValue::from_str(&format!(
+            "{context} offset exceeds the current WASM reader limit. The existing FlatCityBuf WASM bindings use 32-bit usize file offsets, so indexed files whose feature data starts past 4GB need a u64-based HTTP/range reader before they can be queried in the browser."
+        ))
+    }
+
+    #[derive(Debug, Clone)]
+    enum HttpRange64 {
+        Range(Range<u64>),
+        RangeFrom(RangeFrom<u64>),
+    }
+
+    impl HttpRange64 {
+        fn start(&self) -> u64 {
+            match self {
+                Self::Range(range) => range.start,
+                Self::RangeFrom(range) => range.start,
+            }
+        }
+
+        fn length(&self) -> Option<u64> {
+            match self {
+                Self::Range(range) => Some(range.end - range.start),
+                Self::RangeFrom(_) => None,
+            }
+        }
+    }
+
+    #[derive(Debug)]
+    struct HttpSearchResultItem64 {
+        range: HttpRange64,
+    }
+
+    #[derive(Debug)]
+    struct SpatialSearchPage64 {
+        total_count: usize,
+        items: Vec<HttpSearchResultItem64>,
+    }
+
+    #[derive(Debug, PartialEq, Eq)]
+    struct NodeRange {
+        level: usize,
+        nodes: Range<usize>,
+        search_end: usize,
+    }
+
+    async fn http_stream_search64(
+        client: &mut WasmBufferedHttpRangeClient64,
+        index_begin: u64,
+        attr_index_size: u64,
+        num_items: usize,
+        branching_factor: u16,
+        query: SpatialQuery,
+        combine_request_threshold: usize,
+        limit: Option<usize>,
+        offset: usize,
+    ) -> Result<SpatialSearchPage64, JsValue> {
+        if num_items == 0 {
+            return Ok(SpatialSearchPage64 {
+                total_count: 0,
+                items: Vec::new(),
+            });
+        }
+
+        let level_bounds = generate_level_bounds(num_items, branching_factor);
+        let feature_begin = index_begin
+            .checked_add(attr_index_size)
+            .and_then(|offset| {
+                offset.checked_add(PackedRTree::index_size(num_items, branching_factor) as u64)
+            })
+            .ok_or_else(|| JsValue::from_str("feature data offset overflow"))?;
+
+        match query {
+            SpatialQuery::BBox(min_x, min_y, max_x, max_y) => {
+                let bounds = NodeItem::bounds(min_x, min_y, max_x, max_y);
+                let mut queue = VecDeque::new();
+                queue.push_back(NodeRange {
+                    nodes: 0..1,
+                    search_end: 1,
+                    level: level_bounds.len() - 1,
+                });
+                let mut total_count = 0usize;
+                let mut items = Vec::new();
+                let page_limit = limit.unwrap_or(usize::MAX);
+
+                while let Some(node_range) = queue.pop_front() {
+                    let node_items =
+                        read_http_node_items64(client, index_begin, &node_range.nodes).await?;
+                    for (node_pos, node_item) in node_items.iter().enumerate() {
+                        let node_index = node_range.nodes.start + node_pos;
+                        if node_index >= node_range.search_end {
+                            continue;
+                        }
+
+                        if !bounds.intersects(node_item) {
+                            continue;
+                        }
+
+                        if node_range.level == 0 {
+                            let include_in_page = total_count >= offset && items.len() < page_limit;
+                            total_count = total_count.checked_add(1).ok_or_else(|| {
+                                JsValue::from_str("spatial result count overflow")
+                            })?;
+
+                            if !include_in_page {
+                                continue;
+                            }
+
+                            let start = feature_begin
+                                .checked_add(node_item.offset)
+                                .ok_or_else(|| JsValue::from_str("feature range overflow"))?;
+                            if let Some(next_node_item) = node_items.get(node_pos + 1) {
+                                let end = feature_begin
+                                    .checked_add(next_node_item.offset)
+                                    .ok_or_else(|| JsValue::from_str("feature range overflow"))?;
+                                items.push(HttpSearchResultItem64 {
+                                    range: HttpRange64::Range(start..end),
+                                });
+                            } else {
+                                items.push(HttpSearchResultItem64 {
+                                    range: HttpRange64::RangeFrom(start..),
+                                });
+                            }
+                        } else {
+                            let children_level = node_range.level - 1;
+                            let children_start = usize::try_from(node_item.offset)
+                                .map_err(|_| JsValue::from_str("R-tree child index overflow"))?;
+                            let children_end_u64 = node_item
+                                .offset
+                                .checked_add(branching_factor as u64)
+                                .ok_or_else(|| JsValue::from_str("R-tree child range overflow"))?;
+                            let mut children_nodes = children_start
+                                ..usize::try_from(children_end_u64).map_err(|_| {
+                                    JsValue::from_str("R-tree child index overflow")
+                                })?;
+                            let mut search_end = children_nodes.end;
+                            if children_level == 0 {
+                                children_nodes.end =
+                                    children_nodes.end.checked_add(1).ok_or_else(|| {
+                                        JsValue::from_str("R-tree child range overflow")
+                                    })?;
+                            }
+                            children_nodes.end =
+                                children_nodes.end.min(level_bounds[children_level].end);
+                            search_end = search_end.min(level_bounds[children_level].end);
+
+                            let children_range = NodeRange {
+                                nodes: children_nodes,
+                                search_end,
+                                level: children_level,
+                            };
+
+                            let Some(tail) = queue.back_mut() else {
+                                queue.push_back(children_range);
+                                continue;
+                            };
+
+                            if tail.level != children_level {
+                                queue.push_back(children_range);
+                                continue;
+                            }
+
+                            let wasted_bytes = if children_range.nodes.start >= tail.nodes.end {
+                                (children_range.nodes.start - tail.nodes.end)
+                                    * std::mem::size_of::<NodeItem>()
+                            } else {
+                                0
+                            };
+                            if wasted_bytes > combine_request_threshold {
+                                queue.push_back(children_range);
+                                continue;
+                            }
+
+                            tail.nodes.end = children_range.nodes.end;
+                            tail.search_end = tail.search_end.max(children_range.search_end);
+                        }
+                    }
+                }
+
+                Ok(SpatialSearchPage64 { total_count, items })
+            }
+            SpatialQuery::PointIntersects(_, _) | SpatialQuery::PointNearest(_, _) => {
+                Err(JsValue::from_str(
+                    "Only bbox spatial queries are supported by the u64 WASM range reader.",
+                ))
+            }
+        }
+    }
+
+    async fn read_http_node_items64(
+        client: &mut WasmBufferedHttpRangeClient64,
+        base: u64,
+        node_ids: &Range<usize>,
+    ) -> Result<Vec<NodeItem>, JsValue> {
+        let item_size = std::mem::size_of::<NodeItem>();
+        let begin = base
+            .checked_add((node_ids.start * item_size) as u64)
+            .ok_or_else(|| JsValue::from_str("R-tree node range overflow"))?;
+        let length = node_ids
+            .len()
+            .checked_mul(item_size)
+            .ok_or_else(|| JsValue::from_str("R-tree node request too large"))?;
+        let bytes = client
+            .min_req_size(0)
+            .get_range(begin, length)
+            .await
+            .map_err(|e| JsValue::from_str(&e.to_string()))?;
+
+        let mut node_items = Vec::with_capacity(node_ids.len());
+        for node_item_bytes in bytes.chunks(item_size) {
+            node_items.push(
+                NodeItem::from_reader(&mut std::io::Cursor::new(node_item_bytes))
+                    .map_err(|e| JsValue::from_str(&e.to_string()))?,
+            );
+        }
+        Ok(node_items)
+    }
+
+    fn generate_level_bounds(num_items: usize, node_size: u16) -> Vec<Range<usize>> {
+        let mut level_num_nodes = Vec::new();
+        let mut n = num_items;
+        let mut num_nodes = n;
+        level_num_nodes.push(n);
+        loop {
+            n = n.div_ceil(node_size as usize);
+            num_nodes += n;
+            level_num_nodes.push(n);
+            if n == 1 {
+                break;
+            }
+        }
+
+        let mut level_offsets = Vec::with_capacity(level_num_nodes.len());
+        n = num_nodes;
+        for size in &level_num_nodes {
+            level_offsets.push(n - size);
+            n -= size;
+        }
+
+        let mut level_bounds = Vec::with_capacity(level_num_nodes.len());
+        for i in 0..level_num_nodes.len() {
+            level_bounds.push(level_offsets[i]..level_offsets[i] + level_num_nodes[i]);
+        }
+        level_bounds
     }
 
     enum FeatureSelection {
@@ -628,11 +1010,12 @@ mod wasm {
         async fn next_feature_buffer<T: AsyncHttpRangeClient>(
             &mut self,
             client: &mut AsyncBufferedHttpRangeClient<T>,
-        ) -> Result<Option<Bytes>, Error> {
+            client64: &mut WasmBufferedHttpRangeClient64,
+        ) -> Result<Option<Bytes>, JsValue> {
             match self {
-                FeatureSelection::SelectAll(select_all) => select_all.next_buffer(client).await,
+                FeatureSelection::SelectAll(select_all) => select_all.next_buffer(client64).await,
                 FeatureSelection::SelectSpatial(select_spatial) => {
-                    select_spatial.next_buffer(client).await
+                    select_spatial.next_buffer(client64).await
                 }
                 FeatureSelection::SelectAttr(select_attr) => select_attr.next_buffer(client).await,
             }
@@ -644,14 +1027,14 @@ mod wasm {
         features_left: u64,
 
         /// How many bytes into the file we've read so far
-        pos: usize,
+        pos: u64,
     }
 
     impl SelectAll {
-        async fn next_buffer<T: AsyncHttpRangeClient>(
+        async fn next_buffer(
             &mut self,
-            client: &mut AsyncBufferedHttpRangeClient<T>,
-        ) -> Result<Option<Bytes>, Error> {
+            client: &mut WasmBufferedHttpRangeClient64,
+        ) -> Result<Option<Bytes>, JsValue> {
             client.min_req_size(DEFAULT_HTTP_FETCH_SIZE);
 
             if self.features_left == 0 {
@@ -659,17 +1042,21 @@ mod wasm {
             }
             self.features_left -= 1;
 
-            let mut feature_buffer =
-                BytesMut::from(client.get_range(self.pos, 4).await.map_err(|_| Error)?);
+            let mut feature_buffer = BytesMut::from(
+                client
+                    .get_range(self.pos, 4)
+                    .await
+                    .map_err(|e| JsValue::from_str(&e.to_string()))?,
+            );
             self.pos += 4;
             let feature_size = LittleEndian::read_u32(&feature_buffer) as usize;
             feature_buffer.put(
                 client
                     .get_range(self.pos, feature_size)
                     .await
-                    .map_err(|_| Error)?,
+                    .map_err(|e| JsValue::from_str(&e.to_string()))?,
             );
-            self.pos += feature_size;
+            self.pos += feature_size as u64;
 
             Ok(Some(feature_buffer.freeze()))
         }
@@ -681,10 +1068,10 @@ mod wasm {
     }
 
     impl SelectSpatial {
-        async fn next_buffer<T: AsyncHttpRangeClient>(
+        async fn next_buffer(
             &mut self,
-            client: &mut AsyncBufferedHttpRangeClient<T>,
-        ) -> Result<Option<Bytes>, Error> {
+            client: &mut WasmBufferedHttpRangeClient64,
+        ) -> Result<Option<Bytes>, JsValue> {
             let mut next_buffer = None;
             while next_buffer.is_none() {
                 let Some(feature_batch) = self.feature_batches.last_mut() else {
@@ -706,14 +1093,14 @@ mod wasm {
 
     struct FeatureBatch {
         /// The byte location of each feature within the file
-        feature_ranges: VecDeque<HttpRange>,
+        feature_ranges: VecDeque<HttpRange64>,
     }
 
     impl FeatureBatch {
         async fn make_batches(
-            feature_ranges: Vec<HttpSearchResultItem>,
+            feature_ranges: Vec<HttpSearchResultItem64>,
             combine_request_threshold: usize,
-        ) -> Result<Vec<Self>, Error> {
+        ) -> Result<Vec<Self>, JsValue> {
             let mut batched_ranges = vec![];
 
             for search_result_item in feature_ranges.into_iter() {
@@ -726,7 +1113,7 @@ mod wasm {
 
                 let previous_item = latest_batch.back().expect("we never push an empty batch");
 
-                let HttpRange::Range(Range { end: prev_end, .. }) = previous_item else {
+                let HttpRange64::Range(Range { end: prev_end, .. }) = previous_item else {
                     debug_assert!(false, "This shouldn't happen. Only the very last feature is expected to have an unknown length");
                     let mut new_batch = VecDeque::new();
                     new_batch.push_back(search_result_item.range);
@@ -734,8 +1121,8 @@ mod wasm {
                     continue;
                 };
 
-                let wasted_bytes = search_result_item.range.start() - prev_end;
-                if wasted_bytes < combine_request_threshold {
+                let wasted_bytes = search_result_item.range.start().saturating_sub(*prev_end);
+                if wasted_bytes < combine_request_threshold as u64 {
                     latest_batch.push_back(search_result_item.range)
                 } else {
                     let mut new_batch = VecDeque::new();
@@ -749,7 +1136,7 @@ mod wasm {
             Ok(batches)
         }
 
-        fn new(feature_ranges: VecDeque<HttpRange>) -> Self {
+        fn new(feature_ranges: VecDeque<HttpRange64>) -> Self {
             Self { feature_ranges }
         }
 
@@ -770,19 +1157,22 @@ mod wasm {
             // of the feature buffer for the subsequent request.
             let last_feature_length = last.length().unwrap_or(4);
 
-            let covering_range = first.start()..last.start() + last_feature_length;
+            let covering_len = last
+                .start()
+                .saturating_add(last_feature_length)
+                .saturating_sub(first.start());
 
-            covering_range
-                .len()
+            usize::try_from(covering_len)
+                .unwrap_or(usize::MAX)
                 // Since it's all held in memory, don't fetch more than DEFAULT_HTTP_FETCH_SIZE at a time
                 // unless necessary.
                 .min(DEFAULT_HTTP_FETCH_SIZE)
         }
 
-        async fn next_buffer<T: AsyncHttpRangeClient>(
+        async fn next_buffer(
             &mut self,
-            client: &mut AsyncBufferedHttpRangeClient<T>,
-        ) -> Result<Option<Bytes>, Error> {
+            client: &mut WasmBufferedHttpRangeClient64,
+        ) -> Result<Option<Bytes>, JsValue> {
             let request_size = self.request_size();
             client.set_min_req_size(request_size);
             let Some(feature_range) = self.feature_ranges.pop_front() else {
@@ -790,15 +1180,19 @@ mod wasm {
             };
 
             let mut pos = feature_range.start();
-            let mut feature_buffer =
-                BytesMut::from(client.get_range(pos, 4).await.map_err(|_| Error)?);
+            let mut feature_buffer = BytesMut::from(
+                client
+                    .get_range(pos, 4)
+                    .await
+                    .map_err(|e| JsValue::from_str(&e.to_string()))?,
+            );
             pos += 4;
             let feature_size = LittleEndian::read_u32(&feature_buffer) as usize;
             feature_buffer.put(
                 client
                     .get_range(pos, feature_size)
                     .await
-                    .map_err(|_| Error)?,
+                    .map_err(|e| JsValue::from_str(&e.to_string()))?,
             );
 
             Ok(Some(feature_buffer.freeze()))
@@ -815,7 +1209,7 @@ mod wasm {
         async fn next_buffer<T: AsyncHttpRangeClient>(
             &mut self,
             client: &mut AsyncBufferedHttpRangeClient<T>,
-        ) -> Result<Option<Bytes>, Error> {
+        ) -> Result<Option<Bytes>, JsValue> {
             let Some(range) = self.ranges.get(self.range_pos) else {
                 return Ok(None);
             };
@@ -823,14 +1217,14 @@ mod wasm {
                 client
                     .get_range(range.start(), 4)
                     .await
-                    .map_err(|_| Error)?,
+                    .map_err(|e| JsValue::from_str(&e.to_string()))?,
             );
             let feature_size = LittleEndian::read_u32(&feature_buffer) as usize;
             feature_buffer.put(
                 client
                     .get_range(range.start() + 4, feature_size)
                     .await
-                    .map_err(|_| Error)?,
+                    .map_err(|e| JsValue::from_str(&e.to_string()))?,
             );
             self.range_pos += 1;
             Ok(Some(feature_buffer.freeze()))

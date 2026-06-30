@@ -5,6 +5,7 @@ use cjseq::{
     TextureValues as CjTextureValues,
 };
 
+use crate::error::Result;
 use crate::fb::{
     Column, GeometryType, MaterialMapping, SemanticObject, SemanticSurfaceType, TextureMapping,
 };
@@ -174,52 +175,56 @@ pub(crate) fn decode(
 pub(crate) fn decode_semantics_surfaces(
     semantics_objects: &[SemanticObject],
     semantic_attr_schema: Option<flatbuffers::Vector<'_, flatbuffers::ForwardsUOffset<Column<'_>>>>,
-) -> Vec<SemanticsSurface> {
-    let surfaces = semantics_objects.iter().map(|s| {
-        let surface_type_str = match s.type_() {
-            // For extended semantic surfaces, use the extension_type
-            SemanticSurfaceType::ExtraSemanticSurface => {
-                // Return the extension_type if present, otherwise use a default
-                s.extension_type().unwrap_or("GenericSurface").to_string()
-            }
-            // Standard types mapping
-            SemanticSurfaceType::RoofSurface => "RoofSurface".to_string(),
-            SemanticSurfaceType::GroundSurface => "GroundSurface".to_string(),
-            SemanticSurfaceType::WallSurface => "WallSurface".to_string(),
-            SemanticSurfaceType::ClosureSurface => "ClosureSurface".to_string(),
-            SemanticSurfaceType::OuterCeilingSurface => "OuterCeilingSurface".to_string(),
-            SemanticSurfaceType::OuterFloorSurface => "OuterFloorSurface".to_string(),
-            SemanticSurfaceType::Window => "Window".to_string(),
-            SemanticSurfaceType::Door => "Door".to_string(),
-            SemanticSurfaceType::InteriorWallSurface => "InteriorWallSurface".to_string(),
-            SemanticSurfaceType::CeilingSurface => "CeilingSurface".to_string(),
-            SemanticSurfaceType::FloorSurface => "FloorSurface".to_string(),
-            SemanticSurfaceType::WaterSurface => "WaterSurface".to_string(),
-            SemanticSurfaceType::WaterGroundSurface => "WaterGroundSurface".to_string(),
-            SemanticSurfaceType::WaterClosureSurface => "WaterClosureSurface".to_string(),
-            SemanticSurfaceType::TrafficArea => "TrafficArea".to_string(),
-            SemanticSurfaceType::AuxiliaryTrafficArea => "AuxiliaryTrafficArea".to_string(),
-            SemanticSurfaceType::TransportationMarking => "TransportationMarking".to_string(),
-            SemanticSurfaceType::TransportationHole => "TransportationHole".to_string(),
-            _ => "Unknown".to_string(), // Fallback for unhandled types
-        };
+) -> Result<Vec<SemanticsSurface>> {
+    semantics_objects
+        .iter()
+        .map(|s| {
+            let surface_type_str = match s.type_() {
+                // For extended semantic surfaces, use the extension_type
+                SemanticSurfaceType::ExtraSemanticSurface => {
+                    // Return the extension_type if present, otherwise use a default
+                    s.extension_type().unwrap_or("GenericSurface").to_string()
+                }
+                // Standard types mapping
+                SemanticSurfaceType::RoofSurface => "RoofSurface".to_string(),
+                SemanticSurfaceType::GroundSurface => "GroundSurface".to_string(),
+                SemanticSurfaceType::WallSurface => "WallSurface".to_string(),
+                SemanticSurfaceType::ClosureSurface => "ClosureSurface".to_string(),
+                SemanticSurfaceType::OuterCeilingSurface => "OuterCeilingSurface".to_string(),
+                SemanticSurfaceType::OuterFloorSurface => "OuterFloorSurface".to_string(),
+                SemanticSurfaceType::Window => "Window".to_string(),
+                SemanticSurfaceType::Door => "Door".to_string(),
+                SemanticSurfaceType::InteriorWallSurface => "InteriorWallSurface".to_string(),
+                SemanticSurfaceType::CeilingSurface => "CeilingSurface".to_string(),
+                SemanticSurfaceType::FloorSurface => "FloorSurface".to_string(),
+                SemanticSurfaceType::WaterSurface => "WaterSurface".to_string(),
+                SemanticSurfaceType::WaterGroundSurface => "WaterGroundSurface".to_string(),
+                SemanticSurfaceType::WaterClosureSurface => "WaterClosureSurface".to_string(),
+                SemanticSurfaceType::TrafficArea => "TrafficArea".to_string(),
+                SemanticSurfaceType::AuxiliaryTrafficArea => "AuxiliaryTrafficArea".to_string(),
+                SemanticSurfaceType::TransportationMarking => "TransportationMarking".to_string(),
+                SemanticSurfaceType::TransportationHole => "TransportationHole".to_string(),
+                _ => "Unknown".to_string(), // Fallback for unhandled types
+            };
 
-        let children = s.children().map(|c| c.iter().collect::<Vec<_>>());
+            let children = s.children().map(|c| c.iter().collect::<Vec<_>>());
 
-        let attributes = if let Some(schema) = &semantic_attr_schema {
-            s.attributes().map(|a| decode_attributes(schema, a))
-        } else {
-            None
-        };
+            let attributes = if let Some(schema) = &semantic_attr_schema {
+                s.attributes()
+                    .map(|a| decode_attributes(schema, a))
+                    .transpose()?
+            } else {
+                None
+            };
 
-        SemanticsSurface {
-            thetype: surface_type_str,
-            parent: s.parent(),
-            children,
-            other: attributes,
-        }
-    });
-    surfaces.collect()
+            Ok(SemanticsSurface {
+                thetype: surface_type_str,
+                parent: s.parent(),
+                children,
+                other: attributes,
+            })
+        })
+        .collect()
 }
 
 /// Helper function for recursively decoding semantic values.
@@ -336,8 +341,8 @@ pub(crate) fn decode_semantics(
     semantics_objects: Vec<SemanticObject>,
     semantics_values: Vec<u32>,
     semantic_attr_schema: Option<flatbuffers::Vector<'_, flatbuffers::ForwardsUOffset<Column<'_>>>>,
-) -> Semantics {
-    let surfaces = decode_semantics_surfaces(&semantics_objects, semantic_attr_schema);
+) -> Result<Semantics> {
+    let surfaces = decode_semantics_surfaces(&semantics_objects, semantic_attr_schema)?;
 
     let mut part_lists = PartLists {
         solids,
@@ -362,18 +367,18 @@ pub(crate) fn decode_semantics(
         for &val in &semantics_values {
             leaf.push(if val == u32::MAX { None } else { Some(val) });
         }
-        return Semantics {
+        return Ok(Semantics {
             surfaces,
             values: SemanticsValues::Indices(leaf),
-        };
+        });
     }
 
     let result = decode_semantics_(d, None, None, &mut part_lists, &semantics_values);
 
-    Semantics {
+    Ok(Semantics {
         surfaces,
         values: result,
-    }
+    })
 }
 
 impl GeometryType {
@@ -1127,7 +1132,8 @@ mod tests {
                 geometry.semantics_objects().unwrap().iter().collect(),
                 geometry.semantics().unwrap().iter().collect(),
                 header.semantic_columns(),
-            );
+            )
+            .unwrap();
 
             // Verify decoded surfaces
             assert_eq!(3, decoded.surfaces.len());
@@ -1300,7 +1306,8 @@ mod tests {
                 geometry.semantics_objects().unwrap().iter().collect(),
                 geometry.semantics().unwrap().iter().collect(),
                 None,
-            );
+            )
+            .unwrap();
 
             // Verify decoded surfaces
             assert_eq!(decoded.surfaces.len(), 2);

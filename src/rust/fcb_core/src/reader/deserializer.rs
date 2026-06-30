@@ -249,27 +249,48 @@ pub(crate) fn to_cj_co_type(co_type: CityObjectType, extension_type: Option<&str
 pub fn decode_attributes(
     columns: &flatbuffers::Vector<'_, flatbuffers::ForwardsUOffset<Column<'_>>>,
     attributes: flatbuffers::Vector<'_, u8>,
-) -> serde_json::Value {
+) -> Result<serde_json::Value, Error> {
     if attributes.is_empty() {
-        return serde_json::Value::Object(serde_json::Map::new());
+        return Ok(serde_json::Value::Object(serde_json::Map::new()));
     }
 
     let mut map = serde_json::Map::new();
     let bytes = attributes.bytes();
     let mut offset = 0;
     while offset < bytes.len() {
+        ensure_attribute_bytes(bytes, offset, size_of::<u16>(), "column index")?;
         let col_index = LittleEndian::read_u16(&bytes[offset..offset + size_of::<u16>()]) as u16;
         offset += size_of::<u16>();
         if col_index >= columns.len() as u16 {
-            panic!("column index out of range"); //TODO: handle this as an error
+            return Err(Error::InvalidAttributeValue {
+                msg: format!("column index {col_index} out of range"),
+            });
         }
-        let column = columns.iter().find(|c| c.index() == col_index);
-        if column.is_none() {
-            panic!("column not found"); //TODO: handle this as an error
-        }
-        let column = column.unwrap();
+        let column = columns
+            .iter()
+            .find(|c| c.index() == col_index)
+            .ok_or_else(|| Error::InvalidAttributeValue {
+                msg: format!("column {col_index} not found in schema"),
+            })?;
         match column.type_() {
+            ColumnType::Byte => {
+                ensure_attribute_bytes(bytes, offset, size_of::<i8>(), column.name())?;
+                map.insert(
+                    column.name().to_string(),
+                    serde_json::Value::Number(serde_json::Number::from(bytes[offset] as i8)),
+                );
+                offset += size_of::<i8>();
+            }
+            ColumnType::UByte => {
+                ensure_attribute_bytes(bytes, offset, size_of::<u8>(), column.name())?;
+                map.insert(
+                    column.name().to_string(),
+                    serde_json::Value::Number(serde_json::Number::from(bytes[offset])),
+                );
+                offset += size_of::<u8>();
+            }
             ColumnType::Int => {
+                ensure_attribute_bytes(bytes, offset, size_of::<i32>(), column.name())?;
                 map.insert(
                     column.name().to_string(),
                     serde_json::Value::Number(serde_json::Number::from(LittleEndian::read_i32(
@@ -279,6 +300,7 @@ pub fn decode_attributes(
                 offset += size_of::<i32>();
             }
             ColumnType::UInt => {
+                ensure_attribute_bytes(bytes, offset, size_of::<u32>(), column.name())?;
                 map.insert(
                     column.name().to_string(),
                     serde_json::Value::Number(serde_json::Number::from(LittleEndian::read_u32(
@@ -288,6 +310,7 @@ pub fn decode_attributes(
                 offset += size_of::<u32>();
             }
             ColumnType::Bool => {
+                ensure_attribute_bytes(bytes, offset, size_of::<u8>(), column.name())?;
                 map.insert(
                     column.name().to_string(),
                     serde_json::Value::Bool(bytes[offset] != 0),
@@ -295,6 +318,7 @@ pub fn decode_attributes(
                 offset += size_of::<u8>();
             }
             ColumnType::Short => {
+                ensure_attribute_bytes(bytes, offset, size_of::<i16>(), column.name())?;
                 map.insert(
                     column.name().to_string(),
                     serde_json::Value::Number(serde_json::Number::from(LittleEndian::read_i16(
@@ -304,6 +328,7 @@ pub fn decode_attributes(
                 offset += size_of::<i16>();
             }
             ColumnType::UShort => {
+                ensure_attribute_bytes(bytes, offset, size_of::<u16>(), column.name())?;
                 map.insert(
                     column.name().to_string(),
                     serde_json::Value::Number(serde_json::Number::from(LittleEndian::read_u16(
@@ -313,6 +338,7 @@ pub fn decode_attributes(
                 offset += size_of::<u16>();
             }
             ColumnType::Long => {
+                ensure_attribute_bytes(bytes, offset, size_of::<i64>(), column.name())?;
                 map.insert(
                     column.name().to_string(),
                     serde_json::Value::Number(serde_json::Number::from(LittleEndian::read_i64(
@@ -322,6 +348,7 @@ pub fn decode_attributes(
                 offset += size_of::<i64>();
             }
             ColumnType::ULong => {
+                ensure_attribute_bytes(bytes, offset, size_of::<u64>(), column.name())?;
                 map.insert(
                     column.name().to_string(),
                     serde_json::Value::Number(serde_json::Number::from(LittleEndian::read_u64(
@@ -331,6 +358,7 @@ pub fn decode_attributes(
                 offset += size_of::<u64>();
             }
             ColumnType::Float => {
+                ensure_attribute_bytes(bytes, offset, size_of::<f32>(), column.name())?;
                 let f = LittleEndian::read_f32(&bytes[offset..offset + size_of::<f32>()]);
                 if let Some(num) = serde_json::Number::from_f64(f as f64) {
                     map.insert(column.name().to_string(), serde_json::Value::Number(num));
@@ -338,6 +366,7 @@ pub fn decode_attributes(
                 offset += size_of::<f32>();
             }
             ColumnType::Double => {
+                ensure_attribute_bytes(bytes, offset, size_of::<f64>(), column.name())?;
                 let f = LittleEndian::read_f64(&bytes[offset..offset + size_of::<f64>()]);
                 if let Some(num) = serde_json::Number::from_f64(f) {
                     map.insert(column.name().to_string(), serde_json::Value::Number(num));
@@ -345,36 +374,70 @@ pub fn decode_attributes(
                 offset += size_of::<f64>();
             }
             ColumnType::String => {
+                ensure_attribute_bytes(bytes, offset, size_of::<u32>(), column.name())?;
                 let len = LittleEndian::read_u32(&bytes[offset..offset + size_of::<u32>()]);
                 offset += size_of::<u32>();
+                ensure_attribute_bytes(bytes, offset, len as usize, column.name())?;
                 let s = String::from_utf8(bytes[offset..offset + len as usize].to_vec())
                     .unwrap_or_default();
                 map.insert(column.name().to_string(), serde_json::Value::String(s));
                 offset += len as usize;
             }
             ColumnType::DateTime => {
+                ensure_attribute_bytes(bytes, offset, size_of::<u32>(), column.name())?;
                 let len = LittleEndian::read_u32(&bytes[offset..offset + size_of::<u32>()]);
                 offset += size_of::<u32>();
+                ensure_attribute_bytes(bytes, offset, len as usize, column.name())?;
                 let s = String::from_utf8(bytes[offset..offset + len as usize].to_vec())
                     .unwrap_or_default();
                 map.insert(column.name().to_string(), serde_json::Value::String(s));
                 offset += len as usize;
             }
             ColumnType::Json => {
+                ensure_attribute_bytes(bytes, offset, size_of::<u32>(), column.name())?;
                 let len = LittleEndian::read_u32(&bytes[offset..offset + size_of::<u32>()]);
                 offset += size_of::<u32>();
+                ensure_attribute_bytes(bytes, offset, len as usize, column.name())?;
                 let s = String::from_utf8(bytes[offset..offset + len as usize].to_vec())
                     .unwrap_or_default();
-                map.insert(column.name().to_string(), serde_json::from_str(&s).unwrap());
+                map.insert(column.name().to_string(), serde_json::from_str(&s)?);
                 offset += len as usize;
             }
-
-            // TODO: handle other column types
-            _ => unreachable!(),
+            ColumnType::Binary => {
+                ensure_attribute_bytes(bytes, offset, size_of::<u32>(), column.name())?;
+                let len = LittleEndian::read_u32(&bytes[offset..offset + size_of::<u32>()]);
+                offset += size_of::<u32>();
+                ensure_attribute_bytes(bytes, offset, len as usize, column.name())?;
+                let s = String::from_utf8(bytes[offset..offset + len as usize].to_vec())
+                    .unwrap_or_default();
+                map.insert(column.name().to_string(), serde_json::Value::String(s));
+                offset += len as usize;
+            }
+            unknown => {
+                return Err(Error::UnsupportedColumnType(format!("{unknown:?}")));
+            }
         }
     }
 
-    serde_json::Value::Object(map)
+    Ok(serde_json::Value::Object(map))
+}
+
+fn ensure_attribute_bytes(
+    bytes: &[u8],
+    offset: usize,
+    len: usize,
+    field: &str,
+) -> Result<(), Error> {
+    if offset
+        .checked_add(len)
+        .is_some_and(|end| end <= bytes.len())
+    {
+        return Ok(());
+    }
+
+    Err(Error::InvalidAttributeValue {
+        msg: format!("attribute {field} exceeds feature attribute buffer"),
+    })
 }
 
 pub fn to_cj_feature(
@@ -430,9 +493,14 @@ pub fn to_cj_feature(
                 let attributes = if root_attr_schema.is_none() && co.columns().is_none() {
                     None
                 } else {
-                    co.attributes().map(|a| {
-                        decode_attributes(&co.columns().unwrap_or(root_attr_schema.unwrap()), a)
-                    })
+                    co.attributes()
+                        .map(|a| {
+                            let columns = co.columns().or(root_attr_schema).ok_or_else(|| {
+                                Error::MissingRequiredField("attribute columns".to_string())
+                            })?;
+                            decode_attributes(&columns, a)
+                        })
+                        .transpose()?
                 };
 
                 let children_roles = co
@@ -603,7 +671,7 @@ pub(crate) fn decode_geometry(
             semantics_objects,
             semantics,
             semantic_attr_schema,
-        ))
+        )?)
     } else {
         None
     };

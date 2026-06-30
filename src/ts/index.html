@@ -230,6 +230,7 @@
 
   <!-- Button to trigger query test -->
   <button id="query-test-btn">run query test</button>
+  <button id="reusable-spatial-smoke-btn">run reusable spatial smoke test</button>
   <button id="clear-output-btn">clear output</button>
 
   <!-- CityJSON to OBJ test section -->
@@ -542,6 +543,182 @@
       await iterateFeatures(currentIter);
     }
 
+    function readBboxInputs() {
+      const minX = parseFloat(document.getElementById('min-x-input').value);
+      const minY = parseFloat(document.getElementById('min-y-input').value);
+      const maxX = parseFloat(document.getElementById('max-x-input').value);
+      const maxY = parseFloat(document.getElementById('max-y-input').value);
+
+      if (isNaN(minX) || isNaN(minY) || isNaN(maxX) || isNaN(maxY)) {
+        throw new Error('invalid bbox coordinates. please enter valid numbers.');
+      }
+
+      return { minX, minY, maxX, maxY };
+    }
+
+    function insetBbox(bbox) {
+      const width = bbox.maxX - bbox.minX;
+      const height = bbox.maxY - bbox.minY;
+      if (width <= 0 || height <= 0) {
+        return bbox;
+      }
+
+      return {
+        minX: bbox.minX + width * 0.25,
+        minY: bbox.minY + height * 0.25,
+        maxX: bbox.maxX - width * 0.25,
+        maxY: bbox.maxY - height * 0.25,
+      };
+    }
+
+    function firstFeatureIds(result) {
+      return (result.features ?? []).map((feature) => feature?.id ?? '(missing id)').join(', ');
+    }
+
+    function bboxFromCityJsonExtent(cityJson) {
+      const metadata = cityJson?.metadata;
+      const extent = metadata?.geographicalExtent ?? metadata?.geographical_extent;
+      if (!Array.isArray(extent) || extent.length < 5) {
+        return null;
+      }
+
+      const [minX, minY, , maxX, maxY] = extent;
+      if (![minX, minY, maxX, maxY].every(Number.isFinite)) {
+        return null;
+      }
+
+      if (maxX <= minX || maxY <= minY) {
+        return null;
+      }
+
+      return { minX, minY, maxX, maxY };
+    }
+
+    function bboxFromSpatialExtent(extent) {
+      const bbox = {
+        minX: extent?.minX,
+        minY: extent?.minY,
+        maxX: extent?.maxX,
+        maxY: extent?.maxY,
+      };
+
+      if (![bbox.minX, bbox.minY, bbox.maxX, bbox.maxY].every(Number.isFinite)) {
+        return null;
+      }
+
+      if (bbox.maxX <= bbox.minX || bbox.maxY <= bbox.minY) {
+        return null;
+      }
+
+      return bbox;
+    }
+
+    async function querySpatialFeatures(reader, label, bbox) {
+      const query = new WasmSpatialQuery({
+        type: 'bbox',
+        minX: bbox.minX,
+        minY: bbox.minY,
+        maxX: bbox.maxX,
+        maxY: bbox.maxY,
+      });
+
+      try {
+        log(`${label}: query bbox [${bbox.minX}, ${bbox.minY}, ${bbox.maxX}, ${bbox.maxY}]`);
+        const result = await reader.query_spatial_features(query, 3, 0);
+        log(`${label}: totalCount=${result.totalCount}, returned=${result.features?.length ?? 0}`);
+        log(`${label}: first feature ids=${firstFeatureIds(result) || '(none)'}`);
+        return result;
+      } finally {
+        safelyFreeResource(query, `${label} query`);
+      }
+    }
+
+    async function runReusableSpatialSmokeTest() {
+      log('running reusable spatial smoke test...');
+      const urlInput = document.getElementById('url-input');
+      const url = urlInput.value.trim();
+
+      if (!url) {
+        log('error: please enter a valid url.');
+        return;
+      }
+
+      let reader = null;
+
+      try {
+        await initializeWasm();
+
+        const bboxA = readBboxInputs();
+        const bboxB = insetBbox(bboxA);
+
+        log(`creating reusable httpfcbreader with url: ${url}`);
+        reader = await new HttpFcbReader(url);
+        log('reader created. running A, B, A queries on the same reader...');
+
+        const cityJson = await reader.cityjson();
+        let extentBbox = bboxFromCityJsonExtent(cityJson);
+        let extentSource = 'cityjson metadata';
+        if (extentBbox) {
+          log(`detected cityjson metadata extent bbox: [${extentBbox.minX}, ${extentBbox.minY}, ${extentBbox.maxX}, ${extentBbox.maxY}]`);
+        } else {
+          log(`no usable cityjson metadata extent found. metadata keys: ${Object.keys(cityJson?.metadata ?? {}).join(', ') || '(none)'}`);
+          try {
+            extentBbox = bboxFromSpatialExtent(await reader.spatial_extent());
+            extentSource = 'fcb spatial index';
+            if (extentBbox) {
+              log(`detected fcb spatial index extent bbox: [${extentBbox.minX}, ${extentBbox.minY}, ${extentBbox.maxX}, ${extentBbox.maxY}]`);
+            } else {
+              log('fcb spatial index extent was not usable.');
+            }
+          } catch (extentErr) {
+            log(`could not read fcb spatial index extent: ${extentErr}`);
+          }
+        }
+        let resultA1 = await querySpatialFeatures(reader, 'A1', bboxA);
+        let resultB = await querySpatialFeatures(reader, 'B', bboxB);
+        let resultA2 = await querySpatialFeatures(reader, 'A2', bboxA);
+        let effectiveBboxA = bboxA;
+        let effectiveBboxB = bboxB;
+
+        if ((resultA1.totalCount ?? 0) === 0 && extentBbox) {
+          log(`form bbox returned 0 features. retrying smoke test with dataset extent from ${extentSource}.`);
+          effectiveBboxA = extentBbox;
+          effectiveBboxB = insetBbox(extentBbox);
+          resultA1 = await querySpatialFeatures(reader, 'extent A1', effectiveBboxA);
+          resultB = await querySpatialFeatures(reader, 'extent B', effectiveBboxB);
+          resultA2 = await querySpatialFeatures(reader, 'extent A2', effectiveBboxA);
+        } else if ((resultA1.totalCount ?? 0) === 0) {
+          log('warning: form bbox returned 0 features and no usable cityjson metadata extent was found.');
+        }
+
+        const a1Ids = firstFeatureIds(resultA1);
+        const a2Ids = firstFeatureIds(resultA2);
+        const hasHits = (resultA1.totalCount ?? 0) > 0;
+        const stableA =
+          hasHits &&
+          resultA1.totalCount === resultA2.totalCount &&
+          (resultA1.features?.length ?? 0) === (resultA2.features?.length ?? 0) &&
+          a1Ids === a2Ids;
+
+        log(`B query sanity: totalCount=${resultB.totalCount}, returned=${resultB.features?.length ?? 0}`);
+        log(`effective A bbox: [${effectiveBboxA.minX}, ${effectiveBboxA.minY}, ${effectiveBboxA.maxX}, ${effectiveBboxA.maxY}]`);
+        log(`effective B bbox: [${effectiveBboxB.minX}, ${effectiveBboxB.minY}, ${effectiveBboxB.maxX}, ${effectiveBboxB.maxY}]`);
+
+        if (stableA) {
+          log('reusable spatial smoke test passed: non-empty A query was stable after B on the same reader.');
+        } else if (!hasHits) {
+          log('reusable spatial smoke test inconclusive: A query returned 0 features, so reader reuse was exercised but not meaningfully validated.');
+        } else {
+          log('reusable spatial smoke test failed: A query changed after B on the same reader.');
+        }
+      } catch (err) {
+        log(`error during reusable spatial smoke test: ${err}`);
+        console.error('reusable spatial smoke test error:', err);
+      } finally {
+        safelyFreeResource(reader, 'reusable smoke reader');
+      }
+    }
+
     /**
      * Runs the query test by:
      * 1. Initializing the WASM module if needed.
@@ -770,6 +947,7 @@
 
     // Attach the event listeners
     document.getElementById('query-test-btn').addEventListener('click', runQueryTest);
+    document.getElementById('reusable-spatial-smoke-btn').addEventListener('click', runReusableSpatialSmokeTest);
     document.getElementById('clear-output-btn').addEventListener('click', clearOutput);
     document.getElementById('test-cj-to-obj-btn').addEventListener('click', testCjToObj);
     document.getElementById('test-cjseq-to-cj-btn').addEventListener('click', testCjseqToCj);

@@ -106,6 +106,31 @@ export class HttpFcbReader {
         return ret;
     }
     /**
+     * Read selected features by absolute byte ranges without consuming the reader.
+     *
+     * Expects an array of `{ start, end }` objects, where `end` is exclusive.
+     * Bounded ranges may contain one or more contiguous size-prefixed features.
+     * Returns `{ totalCount, features }`.
+     * @param {any} ranges
+     * @returns {Promise<any>}
+     */
+    query_feature_byte_ranges(ranges) {
+        const ret = wasm.httpfcbreader_query_feature_byte_ranges(this.__wbg_ptr, ranges);
+        return ret;
+    }
+    /**
+     * Read selected features by zero-based feature index spans without consuming the reader.
+     *
+     * Expects an array of `{ start, end }` objects, where `end` is exclusive.
+     * Returns `{ totalCount, features }`.
+     * @param {any} spans
+     * @returns {Promise<any>}
+     */
+    query_feature_index_spans(spans) {
+        const ret = wasm.httpfcbreader_query_feature_index_spans(this.__wbg_ptr, spans);
+        return ret;
+    }
+    /**
      * Query spatially selected features without consuming the reader.
      *
      * Returns `{ totalCount, features }`, where `totalCount` is the number of
@@ -677,7 +702,7 @@ function __wbg_get_imports() {
                     const a = state0.a;
                     state0.a = 0;
                     try {
-                        return wasm_bindgen__convert__closures_____invoke__h232de77cee4b9a32(a, state0.b, arg0, arg1);
+                        return wasm_bindgen__convert__closures_____invoke__h0f20f35e77175f89(a, state0.b, arg0, arg1);
                     } finally {
                         state0.a = a;
                     }
@@ -818,8 +843,8 @@ function __wbg_get_imports() {
             console.warn(arg0);
         },
         __wbindgen_cast_0000000000000001: function(arg0, arg1) {
-            // Cast intrinsic for `Closure(Closure { owned: true, function: Function { arguments: [Externref], shim_idx: 337, ret: Result(Unit), inner_ret: Some(Result(Unit)) }, mutable: true }) -> Externref`.
-            const ret = makeMutClosure(arg0, arg1, wasm_bindgen__convert__closures_____invoke__h2a648cba3f7bc0a9);
+            // Cast intrinsic for `Closure(Closure { owned: true, function: Function { arguments: [Externref], shim_idx: 354, ret: Result(Unit), inner_ret: Some(Result(Unit)) }, mutable: true }) -> Externref`.
+            const ret = makeMutClosure(arg0, arg1, wasm_bindgen__convert__closures_____invoke__h4faa76097a37694e);
             return ret;
         },
         __wbindgen_cast_0000000000000002: function(arg0) {
@@ -858,15 +883,15 @@ function __wbg_get_imports() {
     };
 }
 
-function wasm_bindgen__convert__closures_____invoke__h2a648cba3f7bc0a9(arg0, arg1, arg2) {
-    const ret = wasm.wasm_bindgen__convert__closures_____invoke__h2a648cba3f7bc0a9(arg0, arg1, arg2);
+function wasm_bindgen__convert__closures_____invoke__h4faa76097a37694e(arg0, arg1, arg2) {
+    const ret = wasm.wasm_bindgen__convert__closures_____invoke__h4faa76097a37694e(arg0, arg1, arg2);
     if (ret[1]) {
         throw takeFromExternrefTable0(ret[0]);
     }
 }
 
-function wasm_bindgen__convert__closures_____invoke__h232de77cee4b9a32(arg0, arg1, arg2, arg3) {
-    wasm.wasm_bindgen__convert__closures_____invoke__h232de77cee4b9a32(arg0, arg1, arg2, arg3);
+function wasm_bindgen__convert__closures_____invoke__h0f20f35e77175f89(arg0, arg1, arg2, arg3) {
+    wasm.wasm_bindgen__convert__closures_____invoke__h0f20f35e77175f89(arg0, arg1, arg2, arg3);
 }
 
 const AsyncFeatureIterFinalization = (typeof FinalizationRegistry === 'undefined')

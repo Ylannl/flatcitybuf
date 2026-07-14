@@ -11,7 +11,7 @@ mod wasm {
     use js_sys::Array;
 
     use log::Level;
-    use serde::Serialize;
+    use serde::{Deserialize, Serialize};
     use wasm_bindgen::prelude::*;
 
     use fcb_core::static_btree::{FixedStringKey, Float, HttpIndex, HttpMultiIndex, KeyType};
@@ -65,6 +65,18 @@ mod wasm {
         selection: FeatureSelection,
         /// Number of selected features
         count: usize,
+    }
+
+    #[derive(Debug, Deserialize)]
+    struct WasmFeatureIndexSpan {
+        start: usize,
+        end: usize,
+    }
+
+    #[derive(Debug, Deserialize)]
+    struct WasmFeatureByteRange {
+        start: u64,
+        end: Option<u64>,
     }
 
     #[wasm_bindgen(start)]
@@ -326,21 +338,90 @@ mod wasm {
             offset: Option<u32>,
         ) -> Result<JsValue, JsValue> {
             let (total_count, mut selection) = self.spatial_selection(query, limit, offset).await?;
+            self.collect_selection_features(total_count, &mut selection)
+                .await
+        }
+
+        /// Read selected features by zero-based feature index spans without consuming the reader.
+        ///
+        /// Expects an array of `{ start, end }` objects, where `end` is exclusive.
+        /// Returns `{ totalCount, features }`.
+        #[wasm_bindgen]
+        pub async fn query_feature_index_spans(
+            &mut self,
+            spans: JsValue,
+        ) -> Result<JsValue, JsValue> {
+            let spans: Vec<WasmFeatureIndexSpan> = serde_wasm_bindgen::from_value(spans)
+                .map_err(|e| JsValue::from_str(&e.to_string()))?;
+            let total_count = spans.iter().try_fold(0usize, |sum, span| {
+                span.end
+                    .checked_sub(span.start)
+                    .and_then(|count| sum.checked_add(count))
+                    .ok_or_else(|| JsValue::from_str("feature index span count overflow"))
+            })?;
+            let mut selection = self.feature_index_selection(spans).await?;
+            self.collect_selection_features(total_count, &mut selection)
+                .await
+        }
+
+        /// Read selected features by absolute byte ranges without consuming the reader.
+        ///
+        /// Expects an array of `{ start, end }` objects, where `end` is exclusive.
+        /// Bounded ranges may contain one or more contiguous size-prefixed features.
+        /// Returns `{ totalCount, features }`.
+        #[wasm_bindgen]
+        pub async fn query_feature_byte_ranges(
+            &mut self,
+            ranges: JsValue,
+        ) -> Result<JsValue, JsValue> {
+            let ranges: Vec<WasmFeatureByteRange> = serde_wasm_bindgen::from_value(ranges)
+                .map_err(|e| JsValue::from_str(&e.to_string()))?;
+            let features = Array::new();
+
+            for range in ranges {
+                if let Some(end) = range.end {
+                    if end <= range.start {
+                        return Err(JsValue::from_str(
+                            "feature byte range end must be greater than start",
+                        ));
+                    }
+                    let length = usize::try_from(end - range.start).map_err(|_| {
+                        JsValue::from_str("feature byte range length exceeds the WASM memory limit")
+                    })?;
+                    let chunk = self
+                        .client64
+                        .get_range(range.start, length)
+                        .await
+                        .map_err(|e| JsValue::from_str(&e.to_string()))?;
+                    self.collect_features_from_byte_chunk(&chunk, &features)?;
+                } else {
+                    let buffer = self.read_feature_buffer_at(range.start).await?;
+                    self.push_decoded_feature(&buffer, &features)?;
+                }
+            }
+
+            let result = js_sys::Object::new();
+            js_sys::Reflect::set(
+                &result,
+                &JsValue::from_str("totalCount"),
+                &JsValue::from_f64(features.length() as f64),
+            )?;
+            js_sys::Reflect::set(&result, &JsValue::from_str("features"), &features)?;
+            Ok(result.into())
+        }
+
+        async fn collect_selection_features(
+            &mut self,
+            total_count: usize,
+            selection: &mut FeatureSelection,
+        ) -> Result<JsValue, JsValue> {
             let features = Array::new();
 
             while let Some(buffer) = selection
                 .next_feature_buffer(&mut self.client, &mut self.client64)
                 .await?
             {
-                self.fbs.features_buf = buffer.to_vec();
-                let feature = size_prefixed_root_as_city_feature(&self.fbs.features_buf)
-                    .map_err(|e| JsValue::from_str(&e.to_string()))?;
-                let header = self.fbs.header();
-                let cj_feature =
-                    to_cj_feature(feature, header.columns(), header.semantic_columns())
-                        .map_err(|e| JsValue::from_str(&e.to_string()))?;
-
-                features.push(&to_js_value(&cj_feature)?);
+                self.push_decoded_feature(&buffer, &features)?;
             }
 
             let result = js_sys::Object::new();
@@ -351,6 +432,150 @@ mod wasm {
             )?;
             js_sys::Reflect::set(&result, &JsValue::from_str("features"), &features)?;
             Ok(result.into())
+        }
+
+        fn collect_features_from_byte_chunk(
+            &mut self,
+            chunk: &[u8],
+            features: &Array,
+        ) -> Result<(), JsValue> {
+            let mut cursor = 0usize;
+            while cursor < chunk.len() {
+                if chunk.len().saturating_sub(cursor) < 4 {
+                    return Err(JsValue::from_str(
+                        "feature byte range ended inside a size prefix",
+                    ));
+                }
+
+                let feature_size = LittleEndian::read_u32(&chunk[cursor..cursor + 4]) as usize;
+                let feature_end = cursor
+                    .checked_add(4)
+                    .and_then(|value| value.checked_add(feature_size))
+                    .ok_or_else(|| JsValue::from_str("feature byte range size overflow"))?;
+                if feature_end > chunk.len() {
+                    return Err(JsValue::from_str(
+                        "feature byte range ended inside a feature buffer",
+                    ));
+                }
+
+                self.push_decoded_feature(&chunk[cursor..feature_end], features)?;
+                cursor = feature_end;
+            }
+
+            Ok(())
+        }
+
+        async fn read_feature_buffer_at(&mut self, start: u64) -> Result<Bytes, JsValue> {
+            let mut feature_buffer = BytesMut::from(
+                self.client64
+                    .get_range(start, 4)
+                    .await
+                    .map_err(|e| JsValue::from_str(&e.to_string()))?,
+            );
+            let feature_size = LittleEndian::read_u32(&feature_buffer) as usize;
+            feature_buffer.put(
+                self.client64
+                    .get_range(start + 4, feature_size)
+                    .await
+                    .map_err(|e| JsValue::from_str(&e.to_string()))?,
+            );
+            Ok(feature_buffer.freeze())
+        }
+
+        fn push_decoded_feature(&mut self, buffer: &[u8], features: &Array) -> Result<(), JsValue> {
+            self.fbs.features_buf = buffer.to_vec();
+            let feature = size_prefixed_root_as_city_feature(&self.fbs.features_buf)
+                .map_err(|e| JsValue::from_str(&e.to_string()))?;
+            let header = self.fbs.header();
+            let cj_feature = to_cj_feature(feature, header.columns(), header.semantic_columns())
+                .map_err(|e| JsValue::from_str(&e.to_string()))?;
+
+            features.push(&to_js_value(&cj_feature)?);
+            Ok(())
+        }
+
+        async fn feature_index_selection(
+            &mut self,
+            spans: Vec<WasmFeatureIndexSpan>,
+        ) -> Result<FeatureSelection, JsValue> {
+            let header = self.fbs.header();
+            let index_node_size = header.index_node_size();
+            let features_count = header.features_count() as usize;
+            if index_node_size == 0 || features_count == 0 {
+                return Err(JsValue::from_str("NoIndex"));
+            }
+
+            let feature_begin = self.feature_begin_u64();
+            let index_begin = self.header_len() as u64;
+            let level_bounds = generate_level_bounds(features_count, index_node_size);
+            let leaf_start = level_bounds
+                .first()
+                .ok_or_else(|| JsValue::from_str("R-tree leaf level not found"))?
+                .start;
+            let mut feature_ranges = Vec::new();
+
+            for span in spans {
+                if span.start >= span.end {
+                    return Err(JsValue::from_str(
+                        "feature index span end must be greater than start",
+                    ));
+                }
+                if span.end > features_count {
+                    return Err(JsValue::from_str(
+                        "feature index span exceeds FCB feature count",
+                    ));
+                }
+
+                let node_start = leaf_start
+                    .checked_add(span.start)
+                    .ok_or_else(|| JsValue::from_str("feature index span overflow"))?;
+                let node_end = leaf_start
+                    .checked_add(span.end)
+                    .ok_or_else(|| JsValue::from_str("feature index span overflow"))?;
+                let read_end = if span.end < features_count {
+                    node_end
+                        .checked_add(1)
+                        .ok_or_else(|| JsValue::from_str("feature index span overflow"))?
+                } else {
+                    node_end
+                };
+                let node_items = read_http_node_items64(
+                    &mut self.client64,
+                    index_begin,
+                    &(node_start..read_end),
+                )
+                .await?;
+
+                for feature_index in span.start..span.end {
+                    let node_pos = feature_index - span.start;
+                    let node_item = node_items
+                        .get(node_pos)
+                        .ok_or_else(|| JsValue::from_str("feature index node not found"))?;
+                    let start = feature_begin
+                        .checked_add(node_item.offset)
+                        .ok_or_else(|| JsValue::from_str("feature range overflow"))?;
+                    if feature_index + 1 < features_count {
+                        let next_node_item = node_items.get(node_pos + 1).ok_or_else(|| {
+                            JsValue::from_str("next feature index node not found")
+                        })?;
+                        let end = feature_begin
+                            .checked_add(next_node_item.offset)
+                            .ok_or_else(|| JsValue::from_str("feature range overflow"))?;
+                        feature_ranges.push(HttpSearchResultItem64 {
+                            range: HttpRange64::Range(start..end),
+                        });
+                    } else {
+                        feature_ranges.push(HttpSearchResultItem64 {
+                            range: HttpRange64::RangeFrom(start..),
+                        });
+                    }
+                }
+            }
+
+            let feature_batches = FeatureBatch::make_batches(feature_ranges, 256 * 1024).await?;
+            Ok(FeatureSelection::SelectSpatial(SelectSpatial {
+                feature_batches,
+            }))
         }
 
         async fn spatial_selection(

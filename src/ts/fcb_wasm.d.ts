@@ -27,6 +27,21 @@ export class HttpFcbReader {
     meta(): any;
     constructor(url: string);
     /**
+     * Read selected features by absolute byte ranges without consuming the reader.
+     *
+     * Expects an array of `{ start, end }` objects, where `end` is exclusive.
+     * Bounded ranges may contain one or more contiguous size-prefixed features.
+     * Returns `{ totalCount, features }`.
+     */
+    query_feature_byte_ranges(ranges: any): Promise<any>;
+    /**
+     * Read selected features by zero-based feature index spans without consuming the reader.
+     *
+     * Expects an array of `{ start, end }` objects, where `end` is exclusive.
+     * Returns `{ totalCount, features }`.
+     */
+    query_feature_index_spans(spans: any): Promise<any>;
+    /**
      * Query spatially selected features without consuming the reader.
      *
      * Returns `{ totalCount, features }`, where `totalCount` is the number of
@@ -135,6 +150,8 @@ export interface InitOutput {
     readonly httpfcbreader_cityjson: (a: number) => [number, number, number];
     readonly httpfcbreader_meta: (a: number) => [number, number, number];
     readonly httpfcbreader_new: (a: number, b: number) => any;
+    readonly httpfcbreader_query_feature_byte_ranges: (a: number, b: any) => any;
+    readonly httpfcbreader_query_feature_index_spans: (a: number, b: any) => any;
     readonly httpfcbreader_query_spatial_features: (a: number, b: number, c: number, d: number) => any;
     readonly httpfcbreader_select_all: (a: number) => any;
     readonly httpfcbreader_select_attr_query: (a: number, b: number) => any;
@@ -155,8 +172,8 @@ export interface InitOutput {
     readonly wasmspatialquery_y: (a: number) => [number, number];
     readonly cjToObj: (a: any) => [number, number, number, number];
     readonly cjseqToCj: (a: any, b: any) => [number, number, number];
-    readonly wasm_bindgen__convert__closures_____invoke__h2a648cba3f7bc0a9: (a: number, b: number, c: any) => [number, number];
-    readonly wasm_bindgen__convert__closures_____invoke__h232de77cee4b9a32: (a: number, b: number, c: any, d: any) => void;
+    readonly wasm_bindgen__convert__closures_____invoke__h4faa76097a37694e: (a: number, b: number, c: any) => [number, number];
+    readonly wasm_bindgen__convert__closures_____invoke__h0f20f35e77175f89: (a: number, b: number, c: any, d: any) => void;
     readonly __wbindgen_malloc: (a: number, b: number) => number;
     readonly __wbindgen_realloc: (a: number, b: number, c: number, d: number) => number;
     readonly __wbindgen_exn_store: (a: number) => void;
